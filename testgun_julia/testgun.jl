@@ -1,0 +1,218 @@
+# This file combines the implementation in NEP-PACK's `method_blocknewton.jl`
+# with a simple gun problem example.
+#
+# The goal is to provide a convenient standalone script for:
+#   1. testing and debugging the block Newton method on the gun problem, and
+#   2. reproducing the corresponding experiments in MATLAB.
+
+
+# NEP-PACK provides a converted version of the gun problem nlevp_native_gun()
+# function nlevp_native_gun()
+#     gunbase=joinpath(dirname(@__FILE__()),
+#       "converted_nlevp", "gun_")
+#     K=read_sparse_matrix(gunbase * "K.txt", Int64)
+#     M=read_sparse_matrix(gunbase * "M.txt", Int64)
+#     W1=read_sparse_matrix(gunbase * "W1.txt", Int64)
+#     W2=read_sparse_matrix(gunbase * "W2.txt", Int64)
+#     # The gun problem is a sum of a PEP and a problem containing square roots.
+#     pep=PEP([K,-M])
+#     sqrt1op= S -> 1im*sqrt(S)
+#     sqrt2op= S -> 1im*sqrt(S-108.8774^2*one(S))
+#     sqrtnep=SPMF_NEP([W1,W2],[sqrt1op,sqrt2op])
+#     nep=SumNEP(pep,sqrtnep)
+#     return nep
+# end
+
+
+using LinearAlgebra
+using NonlinearEigenproblems
+
+# define the error measure for the block Newton method.
+default_block_errmeasure(nep::NEP) = (S,X) -> opnorm(compute_MM(nep,S,X))
+
+# setup the problem
+nep=nep_gallery("nlevp_native_gun");
+errmeasure::Function =  default_block_errmeasure(nep::NEP)
+n=size(nep,1)
+# initialization
+S=150^2*[1.0 0; 0 1]; X=[[1 0; 0 1]; zeros(n-2,2)];
+
+
+
+# Computes the solution (dX,dS) to the linearized system in one step of
+# the block Newton method for a nonlinear eigenvalue problem
+function newtonstep_linsys1(::Type{T},nep::AbstractSPMF,S, X, W, RT, RV) where {T}
+
+    n = size(nep,1);
+    p = size(X,2); l = size(W,3);
+    dX = zeros(T, n,p); dS = zeros(T,p,p);
+
+    # Fetch the SPMF
+    fv=get_fv(nep);
+    Av=get_Av(nep)
+
+    m = size(fv,1);
+
+    # Initialize a tensor with a f_i(S)
+    fS = zeros(T,p,p,m);
+    for j = 1:m
+        fS[:,:,j] = fv[j](S);
+    end
+
+
+    # Work column by-column
+    for i = 1:p,
+        s = S[i,i];
+
+        # Construct the matrix in equation (20) in Kressner Num. Math.
+        T11=compute_Mder(nep,s)
+        S_expanded = [S I; zero(S) s*I]
+        # T12 = compute_MM(nep,[0*X X],S_expanded) # Can maybe be computed like this? Would avoid the explicit use of Av and and fv
+        T12 = zeros(T,n,p);
+        for j = 1:m
+            DF = fv[j](S_expanded)
+            DF1=DF[1:p,p+1:2*p];
+            T12 = T12 + Av[j]*X*DF1;
+        end
+        T21 = W[:,:,1]';
+        for j = 2:l
+            T21 = T21 + s^(j-1) * W[:,:,j]';
+        end
+        DS = Matrix(1.0I, p, p)
+        T22 = zeros(T,p,p);
+        for j = 2:l
+            T22 = T22 + W[:,:,j]'*X*DS;
+            DS = s*DS + S^(j-2)
+        end
+        TT=[T11 T12; T21 T22]; # This can maybe be optimized with Schur complement
+        sol =  TT \ [RT[:,i];RV[:,i]];
+        # compute the dS and dX
+        dX[:,i] = sol[1:n];
+        dS[:,i] = sol[n+1:end];
+
+        # Update RHS (equation (21)-(22) in Kressner Nummath)
+        if (i<p) # Updated RHS needed in the next for loop
+            Z = zeros(T,p,p);
+            Z[:,i] = dS[:,i]; DS = Z;
+            S2_expanded = [S Z; zero(S) S]
+            for j = 1:m  # Update\tilde{R}_{T2} according to equation (21)
+                Za=dX[:,i]*transpose(fS[i,i+1:p,j]) # First term
+                DF = fv[j](S2_expanded)
+                Zb=X*DF[1:p,p+i+1:2*p]; # Second term
+                RT[:,i+1:p] +=  - Av[j] * (Za+Zb);
+            end
+            for j = 2:l # Update \tilde{R}_{V2} according to equation (22)
+                Za=dX[:,i] * transpose((S^(j-2))[i,i+1:p])
+                Zb=X*DS[:,i+1:p] ;
+                RV[:,i+1:p] +=  -W[:,:,j]' * ( Za +Zb );
+                DS = DS*S + S^(j-2)*DS;
+            end
+        end
+    end
+    return dS,dX
+end
+
+
+# Construct the normalization matrix
+# V=[X;X*S;XS^2;...]
+function Vl(X,S)
+    p=size(S,1); n=size(X,1);
+    V=zeros(eltype(S),n*p,p);
+    for j=1:p
+        V[(j-1)*n .+ (1:n), :] = X * (S^(j-1))
+    end
+    return V
+end
+
+# apply the Armijo rule to the block Newton method. 
+function armijo_rule_block(errmeasure,err0,S,V,ΔS,ΔV,armijo_factor,armijo_max)
+    j=0
+    if (armijo_factor<1)
+        # take smaller and smaller steps until errmeasure is decreasing
+        while (errmeasure(S+ΔS,V+ΔV)>err0 && j<armijo_max)
+            j=j+1;
+            ΔS=ΔS*armijo_factor;
+            ΔV=ΔV*armijo_factor;
+        end
+    end
+    return  (ΔS,ΔV,j,armijo_factor^j)
+end
+
+#################################
+
+T=complex(eltype(S))
+S=complex(S);
+X=complex(X);
+
+n=size(nep,1);
+p=size(S,1);
+
+# Construct the orthogonalization matrix
+W=Vl(X,S);
+# reshape W to WW (3D matrix)
+# minimality index l<=p, here just let l=p
+WW=zeros(T,n,p,p)
+for j=1:size(W,2)
+    WW[:,:,j] = W[(j-1)*n .+ (1:n), :]
+end
+
+local err0=0
+armijo_factor=0.5;
+maxit=15;
+tol=eps(real(eltype(S)))*100;
+armijo_max=5;
+# Main loop
+for k=1:maxit
+    err0=errmeasure(S,X)
+    println("Iter $k, err=$err0")
+    if (err0<tol)
+        return S,X
+    end
+
+    Res= compute_MM(nep,S,X)
+    # @show size(Res) norm(Res)
+    # Solve the linear system by first transforming S to
+    # upper triangular form and then doing a backward substitution
+    # and finally reversing the backward substitution
+    RR,QQ=schur(complex(S))
+    dSt,dXt = newtonstep_linsys1(T,nep,
+                                RR, X*QQ,
+                                WW,  # Orthogonalization matrix/ normalization！
+                                Res*QQ, # RT
+                                zeros(T,p,p),  #RV=0
+                                );
+    dX=dXt*QQ';
+    dS=QQ*dSt*QQ';
+
+
+    local j=1
+    # Update the approximations
+    if (armijo_factor<1)
+        (ΔS,ΔV,j,scaling)=  armijo_rule_block(errmeasure,
+                                                err0,
+                                                S,X,-dS,-dX,
+                                                armijo_factor,armijo_max)
+
+        St=S+ΔS
+        Xt=X+ΔV
+    else
+        j = 0
+        St=S-dS
+        Xt=X-dX
+
+    end
+    if (j>0)
+        println(" Armijo scaling=$scaling")
+    end
+
+
+    # Carry out the orthogonalization
+    W,R = qr(Vl(Xt,St))
+    W = Matrix(W)
+    # reshape W to WW (3D matrix)
+    for j=1:size(W,2)
+        WW[:,:,j] = W[(j-1)*n .+ (1:n), :]
+    end
+    X[:]=Xt/R; S[:]=(R*St)/R;
+end
+
