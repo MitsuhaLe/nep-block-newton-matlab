@@ -18,7 +18,7 @@ for MATLAB users.
 A **detailed reproduction report** is available in:
 
 ```text
-reproduction_report.pdf
+/reproduction_report.pdf
 ```
 
 ---
