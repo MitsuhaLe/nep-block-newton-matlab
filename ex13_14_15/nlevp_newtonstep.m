@@ -12,7 +12,7 @@ function [dX, dS] = nlevp_newtonstep( A, f, X, S, W, RT, RV )
 %
 % Output: Solution (dX,dS) to the linearized equation in one step
 %         of the block Newton method for the NLEVP.
-% A(:,:,j) 多维数组，最后一个指标表示第j个切片，这里也可以理解为矩阵A_j
+% A(:,:,j) = A_j
 % 
 
 
