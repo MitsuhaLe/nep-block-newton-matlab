@@ -18,11 +18,7 @@ for MATLAB users.
 A **detailed reproduction report** is available in:
 
 ```text
-<<<<<<< Updated upstream
-/reproduction_report.pdf
-=======
 others/reproduction_report.pdf
->>>>>>> Stashed changes
 ```
 
 ---
